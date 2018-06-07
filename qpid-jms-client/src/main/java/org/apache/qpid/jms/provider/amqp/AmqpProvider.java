@@ -26,6 +26,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
@@ -88,6 +89,9 @@ import org.slf4j.LoggerFactory;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufUtil;
 import io.netty.util.ReferenceCountUtil;
+import io.netty.util.internal.shaded.org.jctools.queues.MessagePassingQueue;
+import io.netty.util.internal.shaded.org.jctools.queues.MpscChunkedArrayQueue;
+import io.netty.util.internal.shaded.org.jctools.util.Pow2;
 
 /**
  * An AMQP v1.0 Provider.
@@ -134,6 +138,8 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
 
     private final URI remoteURI;
     private final AtomicBoolean closed = new AtomicBoolean();
+    private final MessagePassingQueue<Runnable> tasks;
+    private volatile boolean working;
     private ScheduledThreadPoolExecutor serializer;
     private final org.apache.qpid.proton.engine.Transport protonTransport =
         org.apache.qpid.proton.engine.Transport.Factory.create();
@@ -155,6 +161,7 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
         this.remoteURI = remoteURI;
         this.transport = transport;
 
+        tasks = new MpscChunkedArrayQueue<>(128, Pow2.MAX_POW2);
         serializer = new ScheduledThreadPoolExecutor(1, new QpidJMSThreadFactory(
             "AmqpProvider :(" + PROVIDER_SEQUENCE.incrementAndGet() + "):[" +
             remoteURI.getScheme() + "://" + remoteURI.getHost() + ":" + remoteURI.getPort() + "]", true));
@@ -163,13 +170,65 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
         serializer.setContinueExistingPeriodicTasksAfterShutdownPolicy(false);
     }
 
+    private void execute(Runnable command) {
+        if (!tasks.offer(command)) {
+            throw new RejectedExecutionException();
+        }
+        if (!working) {
+            serializer.execute(this::dutyCycle);
+        }
+    }
+
+    private boolean unflushedData = false;
+
+    private void dutyCycle() {
+        unflushedData = false;
+        try {
+            do {
+                working = true;
+                try {
+                    Runnable task;
+                    while ((task = tasks.poll()) != null) {
+                        try {
+                            task.run();
+                        } catch (Throwable t) {
+                            onDataProcessingError(t);
+                        }
+                    }
+                } finally {
+                    working = false;
+                }
+            } while (!tasks.isEmpty());
+        } finally {
+            if (unflushedData) {
+                flushData();
+            }
+        }
+    }
+
+    private void flushData() {
+        assert unflushedData;
+        try {
+            transport.flushBatch();
+        } catch (Throwable t) {
+            onDataProcessingError(t);
+        } finally {
+            unflushedData = false;
+        }
+    }
+
+    private void onDataProcessingError(Throwable t) {
+        LOG.warn("Caught problem during data processing: {}", t.getMessage(), t);
+        fireProviderException(t);
+    }
+
     @Override
     public void connect(final JmsConnectionInfo connectionInfo) throws IOException {
         checkClosed();
 
         final ProviderFuture connectRequest = new ProviderFuture();
 
-        serializer.execute(new Runnable() {
+        execute(new Runnable() {
 
             @Override
             public void run() {
@@ -288,7 +347,7 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
                 }
             };
 
-            serializer.execute(new Runnable() {
+            execute(new Runnable() {
 
                 @Override
                 public void run() {
@@ -362,7 +421,7 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
     @Override
     public void create(final JmsResource resource, final AsyncResult request) throws IOException, JMSException {
         checkClosed();
-        serializer.execute(new Runnable() {
+        execute(new Runnable() {
 
             @Override
             public void run() {
@@ -439,7 +498,7 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
     @Override
     public void start(final JmsResource resource, final AsyncResult request) throws IOException {
         checkClosed();
-        serializer.execute(new Runnable() {
+        execute(new Runnable() {
 
             @Override
             public void run() {
@@ -466,7 +525,7 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
     @Override
     public void stop(final JmsResource resource, final AsyncResult request) throws IOException {
         checkClosed();
-        serializer.execute(new Runnable() {
+        execute(new Runnable() {
 
             @Override
             public void run() {
@@ -493,7 +552,7 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
     @Override
     public void destroy(final JmsResource resource, final AsyncResult request) throws IOException {
         checkClosed();
-        serializer.execute(new Runnable() {
+        execute(new Runnable() {
 
             @Override
             public void run() {
@@ -595,7 +654,7 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
     @Override
     public void send(final JmsOutboundMessageDispatch envelope, final AsyncResult request) throws IOException {
         checkClosed();
-        serializer.execute(new Runnable() {
+        execute(new Runnable() {
 
             @Override
             public void run() {
@@ -623,7 +682,7 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
     @Override
     public void acknowledge(final JmsSessionId sessionId, final ACK_TYPE ackType, final AsyncResult request) throws IOException {
         checkClosed();
-        serializer.execute(new Runnable() {
+        execute(new Runnable() {
 
             @Override
             public void run() {
@@ -643,7 +702,7 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
     @Override
     public void acknowledge(final JmsInboundMessageDispatch envelope, final ACK_TYPE ackType, final AsyncResult request) throws IOException {
         checkClosed();
-        serializer.execute(new Runnable() {
+        execute(new Runnable() {
 
             @Override
             public void run() {
@@ -679,7 +738,7 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
     @Override
     public void commit(final JmsTransactionInfo transactionInfo, JmsTransactionInfo nextTransactionId, final AsyncResult request) throws IOException {
         checkClosed();
-        serializer.execute(new Runnable() {
+        execute(new Runnable() {
 
             @Override
             public void run() {
@@ -698,7 +757,7 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
     @Override
     public void rollback(final JmsTransactionInfo transactionInfo, JmsTransactionInfo nextTransactionId, final AsyncResult request) throws IOException {
         checkClosed();
-        serializer.execute(new Runnable() {
+        execute(new Runnable() {
 
             @Override
             public void run() {
@@ -717,7 +776,7 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
     @Override
     public void recover(final JmsSessionId sessionId, final AsyncResult request) throws IOException {
         checkClosed();
-        serializer.execute(new Runnable() {
+        execute(new Runnable() {
 
             @Override
             public void run() {
@@ -737,7 +796,7 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
     @Override
     public void unsubscribe(final String subscription, final AsyncResult request) throws IOException {
         checkClosed();
-        serializer.execute(new Runnable() {
+        execute(new Runnable() {
 
             @Override
             public void run() {
@@ -755,7 +814,7 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
     @Override
     public void pull(final JmsConsumerId consumerId, final long timeout, final AsyncResult request) throws IOException {
         checkClosed();
-        serializer.execute(new Runnable() {
+        execute(new Runnable() {
 
             @Override
             public void run() {
@@ -799,11 +858,10 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
 
     @Override
     public void onData(final ByteBuf input) {
-
         // We need to retain until the serializer gets around to processing it.
         ReferenceCountUtil.retain(input);
 
-        serializer.execute(new Runnable() {
+        execute(new Runnable() {
 
             @Override
             public void run() {
@@ -844,7 +902,7 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
     @Override
     public void onTransportError(final Throwable error) {
         if (!serializer.isShutdown()) {
-            serializer.execute(new Runnable() {
+            execute(new Runnable() {
                 @Override
                 public void run() {
                     LOG.info("Transport failed: {}", error.getMessage());
@@ -859,7 +917,7 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
     }
 
     public void scheduleExecuteAndPump(Runnable task) {
-        serializer.execute(new Runnable() {
+        execute(new Runnable() {
             @Override
             public void run() {
                 try {
@@ -886,7 +944,7 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
     @Override
     public void onTransportClosed() {
         if (!serializer.isShutdown()) {
-            serializer.execute(new Runnable() {
+            execute(new Runnable() {
                 @Override
                 public void run() {
                     LOG.debug("Transport connection remotely closed");
@@ -1014,6 +1072,7 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
     protected boolean pumpToProtonTransport(AsyncResult request) {
         try {
             boolean done = false;
+            
             while (!done) {
                 ByteBuffer toWrite = protonTransport.getOutputBuffer();
                 if (toWrite != null && toWrite.hasRemaining()) {
@@ -1024,7 +1083,12 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
                         TRACE_BYTES.info("Sending: {}", ByteBufUtil.hexDump(outbound));
                     }
 
-                    transport.send(outbound);
+                    if (working) {
+                        unflushedData = true;
+                        transport.addBatch(outbound);
+                    } else {
+                        transport.send(outbound);
+                    }
                     protonTransport.outputConsumed();
                 } else {
                     done = true;

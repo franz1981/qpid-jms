@@ -82,6 +82,31 @@ public interface Transport {
     void send(ByteBuf output) throws IOException;
 
     /**
+     * Batch a chunk of data into the Transport connection if there isn't any back-pressure.
+     *
+     * @param output The buffer of data that is to be batched.
+     * @return {@code true} is the transport hasn't enough space to batch data, {@code false} otherwise
+     * @throws IOException if an error occurs during the batch operation.
+     */
+    boolean tryAddBatch(ByteBuf output) throws IOException;
+
+    /**
+     * Batch a chunk of data into the Transport connection.
+     *
+     * @param output The buffer of data that is to be batched.
+     *
+     * @throws IOException if an error occurs during the batch operation.
+     */
+    void addBatch(ByteBuf output) throws IOException;
+
+    /**
+     * Transmit any batched data on the Transport connection.
+     *
+     * @throws IOException if an error occurs during the flush operation.
+     */
+    void flushBatch() throws IOException;
+
+    /**
      * Gets the currently set TransportListener instance
      *
      * @return the current TransportListener or null if none set.

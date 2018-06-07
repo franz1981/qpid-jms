@@ -258,6 +258,37 @@ public class NettyTcpTransport implements Transport {
     }
 
     @Override
+    public boolean tryAddBatch(ByteBuf output) throws IOException {
+        checkConnected(output);
+
+        LOG.trace("Attempted try add batch of: {} bytes", output.readableBytes());
+
+        if (!channel.isWritable()) {
+            LOG.trace("Failed attempts to add batch of data: channel not writable");
+            //is uses the Netty built-in buffer to provide back-pressure
+            return false;
+        }
+        channel.write(output, channel.voidPromise());
+        return true;
+    }
+
+    @Override
+    public void addBatch(ByteBuf output) throws IOException {
+        checkConnected(output);
+
+        LOG.trace("Attempted add batch of: {} bytes", output.readableBytes());
+
+        channel.write(output, channel.voidPromise());
+    }
+
+
+    @Override
+    public void flushBatch() throws IOException {
+        checkConnected();
+        channel.flush();
+    }
+
+    @Override
     public void send(ByteBuf output) throws IOException {
         checkConnected(output);
 
