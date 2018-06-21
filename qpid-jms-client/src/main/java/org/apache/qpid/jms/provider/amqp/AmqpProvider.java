@@ -20,7 +20,6 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufUtil;
 import io.netty.channel.DefaultEventLoop;
 import io.netty.util.ReferenceCountUtil;
-import io.netty.util.internal.shaded.org.jctools.queues.MessagePassingQueue;
 import io.netty.util.internal.shaded.org.jctools.queues.MpscUnboundedArrayQueue;
 import org.apache.qpid.jms.JmsConnectionExtensions;
 import org.apache.qpid.jms.JmsTemporaryDestination;
@@ -60,6 +59,7 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
 
 /**
@@ -109,6 +109,7 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
     private final AtomicBoolean closed = new AtomicBoolean();
     private final MpscUnboundedArrayQueue<Runnable> tasks;
     private final Thread serializerThread;
+    private final AtomicReference<Thread> parkedThread;
     private final Executor serializer;
     private final ScheduledExecutorService scheduler;
     private final org.apache.qpid.proton.engine.Transport protonTransport =
@@ -132,21 +133,54 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
         this.transport = transport;
         final int providerId = PROVIDER_SEQUENCE.incrementAndGet();
         //commands are not batched an it is quite rare they will be
+        parkedThread = new AtomicReference<>();
         tasks = new MpscUnboundedArrayQueue<>(32);
         serializerThread = new Thread(()->{
             final Thread thread = Thread.currentThread();
             final MpscUnboundedArrayQueue<Runnable> commands = tasks;
-            final MessagePassingQueue.Consumer<Runnable> runCommand = Runnable::run;
+            final AtomicReference<Thread> parked = this.parkedThread;
+
             while (!thread.isInterrupted()) {
-                while (commands.drain(runCommand) > 0) ;
-                LockSupport.parkNanos(1);
+                do {
+                    parked.set(null);
+                    try {
+                        boolean stopIdle;
+                        do {
+                            Runnable command;
+                            while ((command = commands.poll()) != null) {
+                                try {
+                                    command.run();
+                                } finally {
+                                    //TODO address me please
+                                }
+                            }
+                            //employ some idle strategy to avoid thread signaling
+                            int idleCount = 0;
+                            do {
+                                idleCount = idle(idleCount);
+                                stopIdle = !tasks.isEmpty();
+                            } while (idleCount > 0 && !stopIdle);
+                        } while (stopIdle);
+                    } finally {
+                        parked.set(thread);
+                    }
+                } while (!tasks.isEmpty());
+                //now it can really go to sleep
+                LockSupport.park();
+                //if it will spuriously awake is not that bad, it could happen!
             }
-            while (commands.drain(runCommand) > 0) ;
+            parked.set(null);
+            while (commands.drain(Runnable::run) > 0) ;
         });
         serializer = new Executor() {
             @Override
             public void execute(Runnable command) {
                 tasks.add(command);
+                //there is a full barrier thanks to Mpsc impl
+                final Thread thread = parkedThread.get();
+                if (thread != null) {
+                    LockSupport.unpark(thread);
+                }
             }
         };
         serializerThread.setName("AmqpProvider Serializer :(" + providerId + "):[" +
@@ -156,6 +190,25 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
         scheduler = new DefaultEventLoop(new QpidJMSThreadFactory(
                 "AmqpProvider Timer :(" + providerId + "):[" +
                         remoteURI.getScheme() + "://" + remoteURI.getHost() + ":" + remoteURI.getPort() + "]", true));
+    }
+
+    public static int idle(int idleCount) {
+        assert idleCount>=0;
+        if (idleCount < 10) {
+            idleCount++;
+        } else if (idleCount < 20) {
+            Thread.yield();
+            idleCount++;
+        } else if (idleCount < 100) {
+            LockSupport.parkNanos(1);
+            idleCount++;
+        } else if (idleCount < 10_000) {
+            LockSupport.parkNanos(1000);
+            idleCount++;
+        } else {
+            idleCount = -1;
+        }
+        return idleCount;
     }
 
     @Override
