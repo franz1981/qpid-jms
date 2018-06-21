@@ -16,50 +16,20 @@
  */
 package org.apache.qpid.jms.provider.amqp;
 
-import java.io.IOException;
-import java.net.URI;
-import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.concurrent.Future;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.ScheduledThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
-
-import javax.jms.JMSException;
-import javax.jms.JMSSecurityRuntimeException;
-import javax.net.ssl.SSLContext;
-
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufUtil;
+import io.netty.channel.DefaultEventLoop;
+import io.netty.util.ReferenceCountUtil;
+import io.netty.util.internal.shaded.org.jctools.queues.MessagePassingQueue;
+import io.netty.util.internal.shaded.org.jctools.queues.MpscUnboundedArrayQueue;
 import org.apache.qpid.jms.JmsConnectionExtensions;
 import org.apache.qpid.jms.JmsTemporaryDestination;
 import org.apache.qpid.jms.message.JmsInboundMessageDispatch;
 import org.apache.qpid.jms.message.JmsMessageFactory;
 import org.apache.qpid.jms.message.JmsOutboundMessageDispatch;
-import org.apache.qpid.jms.meta.JmsConnectionInfo;
-import org.apache.qpid.jms.meta.JmsConsumerId;
-import org.apache.qpid.jms.meta.JmsConsumerInfo;
-import org.apache.qpid.jms.meta.JmsDefaultResourceVisitor;
-import org.apache.qpid.jms.meta.JmsProducerId;
-import org.apache.qpid.jms.meta.JmsProducerInfo;
-import org.apache.qpid.jms.meta.JmsResource;
-import org.apache.qpid.jms.meta.JmsResourceVistor;
-import org.apache.qpid.jms.meta.JmsSessionId;
-import org.apache.qpid.jms.meta.JmsSessionInfo;
-import org.apache.qpid.jms.meta.JmsTransactionInfo;
-import org.apache.qpid.jms.provider.AsyncResult;
-import org.apache.qpid.jms.provider.NoOpAsyncResult;
-import org.apache.qpid.jms.provider.Provider;
-import org.apache.qpid.jms.provider.ProviderClosedException;
+import org.apache.qpid.jms.meta.*;
+import org.apache.qpid.jms.provider.*;
 import org.apache.qpid.jms.provider.ProviderConstants.ACK_TYPE;
-import org.apache.qpid.jms.provider.ProviderFuture;
-import org.apache.qpid.jms.provider.ProviderListener;
 import org.apache.qpid.jms.provider.amqp.builders.AmqpClosedConnectionBuilder;
 import org.apache.qpid.jms.provider.amqp.builders.AmqpConnectionBuilder;
 import org.apache.qpid.jms.sasl.Mechanism;
@@ -70,14 +40,8 @@ import org.apache.qpid.jms.util.IOExceptionSupport;
 import org.apache.qpid.jms.util.PropertyUtil;
 import org.apache.qpid.jms.util.QpidJMSThreadFactory;
 import org.apache.qpid.jms.util.ThreadPoolUtils;
-import org.apache.qpid.proton.engine.Collector;
-import org.apache.qpid.proton.engine.Connection;
-import org.apache.qpid.proton.engine.Delivery;
-import org.apache.qpid.proton.engine.EndpointState;
-import org.apache.qpid.proton.engine.Event;
+import org.apache.qpid.proton.engine.*;
 import org.apache.qpid.proton.engine.Event.Type;
-import org.apache.qpid.proton.engine.Sasl;
-import org.apache.qpid.proton.engine.SaslListener;
 import org.apache.qpid.proton.engine.impl.CollectorImpl;
 import org.apache.qpid.proton.engine.impl.ProtocolTracer;
 import org.apache.qpid.proton.engine.impl.TransportImpl;
@@ -86,9 +50,17 @@ import org.apache.qpid.proton.framing.TransportFrame;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import io.netty.buffer.ByteBuf;
-import io.netty.buffer.ByteBufUtil;
-import io.netty.util.ReferenceCountUtil;
+import javax.jms.JMSException;
+import javax.jms.JMSSecurityRuntimeException;
+import javax.net.ssl.SSLContext;
+import java.io.IOException;
+import java.net.URI;
+import java.nio.ByteBuffer;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.LockSupport;
 
 /**
  * An AMQP v1.0 Provider.
@@ -135,7 +107,10 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
 
     private final URI remoteURI;
     private final AtomicBoolean closed = new AtomicBoolean();
-    private ScheduledThreadPoolExecutor serializer;
+    private final MpscUnboundedArrayQueue<Runnable> tasks;
+    private final Thread serializerThread;
+    private final Executor serializer;
+    private final ScheduledExecutorService scheduler;
     private final org.apache.qpid.proton.engine.Transport protonTransport =
         org.apache.qpid.proton.engine.Transport.Factory.create();
     private final Collector protonCollector = new CollectorImpl();
@@ -155,13 +130,32 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
     public AmqpProvider(URI remoteURI, Transport transport) {
         this.remoteURI = remoteURI;
         this.transport = transport;
-
-        serializer = new ScheduledThreadPoolExecutor(1, new QpidJMSThreadFactory(
-            "AmqpProvider :(" + PROVIDER_SEQUENCE.incrementAndGet() + "):[" +
-            remoteURI.getScheme() + "://" + remoteURI.getHost() + ":" + remoteURI.getPort() + "]", true));
-
-        serializer.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
-        serializer.setContinueExistingPeriodicTasksAfterShutdownPolicy(false);
+        final int providerId = PROVIDER_SEQUENCE.incrementAndGet();
+        //commands are not batched an it is quite rare they will be
+        tasks = new MpscUnboundedArrayQueue<>(32);
+        serializerThread = new Thread(()->{
+            final Thread thread = Thread.currentThread();
+            final MpscUnboundedArrayQueue<Runnable> commands = tasks;
+            final MessagePassingQueue.Consumer<Runnable> runCommand = Runnable::run;
+            while (!thread.isInterrupted()) {
+                while (commands.drain(runCommand) > 0) ;
+                LockSupport.parkNanos(1);
+            }
+            while (commands.drain(runCommand) > 0) ;
+        });
+        serializer = new Executor() {
+            @Override
+            public void execute(Runnable command) {
+                tasks.add(command);
+            }
+        };
+        serializerThread.setName("AmqpProvider Serializer :(" + providerId + "):[" +
+                remoteURI.getScheme() + "://" + remoteURI.getHost() + ":" + remoteURI.getPort() + "]");
+        serializerThread.setDaemon(true);
+        serializerThread.start();
+        scheduler = new DefaultEventLoop(new QpidJMSThreadFactory(
+                "AmqpProvider Timer :(" + providerId + "):[" +
+                        remoteURI.getScheme() + "://" + remoteURI.getHost() + ":" + remoteURI.getPort() + "]", true));
     }
 
     @Override
@@ -373,7 +367,13 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
                         }
                     }
                 } finally {
-                    ThreadPoolUtils.shutdownGraceful(serializer);
+                    ThreadPoolUtils.shutdownGraceful(scheduler);
+                    serializerThread.interrupt();
+                    try {
+                        serializerThread.join();
+                    } catch (InterruptedException e) {
+                        //NOOP
+                    }
                 }
             }
         }
@@ -870,7 +870,7 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
      */
     @Override
     public void onTransportError(final Throwable error) {
-        if (!serializer.isShutdown()) {
+        if (!serializerThread.isInterrupted()) {
             serializer.execute(new Runnable() {
                 @Override
                 public void run() {
@@ -912,7 +912,7 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
      */
     @Override
     public void onTransportClosed() {
-        if (!serializer.isShutdown()) {
+        if (!serializerThread.isInterrupted()) {
             serializer.execute(new Runnable() {
                 @Override
                 public void run() {
@@ -1076,7 +1076,8 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
         if (deadline != 0) {
             long delay = deadline - now;
             LOG.trace("IdleTimeoutCheck being initiated, initial delay: {}", delay);
-            nextIdleTimeoutCheck = serializer.schedule(new IdleTimeoutCheck(), delay, TimeUnit.MILLISECONDS);
+            final IdleTimeoutCheck idleTimeoutCheck = new IdleTimeoutCheck();
+            nextIdleTimeoutCheck = scheduler.schedule(()->serializer.execute(idleTimeoutCheck), delay, TimeUnit.MILLISECONDS);
         }
 
         ProviderListener listener = this.listener;
@@ -1367,8 +1368,9 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
         return protonConnection;
     }
 
-    ScheduledExecutorService getScheduler() {
-        return this.serializer;
+
+    ScheduledFuture<?> schedule(final Runnable task, long delay, TimeUnit timeUnit){
+        return this.scheduler.schedule(()->serializer.execute(task), delay, timeUnit);
     }
 
     @Override
@@ -1392,7 +1394,7 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
      */
     public ScheduledFuture<?> scheduleRequestTimeout(final AsyncResult request, long timeout, final Exception error) {
         if (timeout != JmsConnectionInfo.INFINITE) {
-            return serializer.schedule(new Runnable() {
+            final Runnable task = new Runnable() {
 
                 @Override
                 public void run() {
@@ -1400,7 +1402,8 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
                     pumpToProtonTransport();
                 }
 
-            }, timeout, TimeUnit.MILLISECONDS);
+            };
+            return scheduler.schedule(()->serializer.execute(task), timeout, TimeUnit.MILLISECONDS);
         }
 
         return null;
@@ -1422,7 +1425,7 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
      */
     public ScheduledFuture<?> scheduleRequestTimeout(final AsyncResult request, long timeout, final AmqpExceptionBuilder builder) {
         if (timeout != JmsConnectionInfo.INFINITE) {
-            return serializer.schedule(new Runnable() {
+            final Runnable task = new Runnable() {
 
                 @Override
                 public void run() {
@@ -1430,7 +1433,8 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
                     pumpToProtonTransport();
                 }
 
-            }, timeout, TimeUnit.MILLISECONDS);
+            };
+            return scheduler.schedule(()->serializer.execute(task), timeout, TimeUnit.MILLISECONDS);
         }
 
         return null;
@@ -1504,7 +1508,7 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
                         long delay = deadline - now;
                         checkScheduled = true;
                         LOG.trace("IdleTimeoutCheck rescheduling with delay: {}", delay);
-                        nextIdleTimeoutCheck = serializer.schedule(this, delay, TimeUnit.MILLISECONDS);
+                        nextIdleTimeoutCheck = scheduler.schedule(()->serializer.execute(this), delay, TimeUnit.MILLISECONDS);
                     }
                 }
             } else {
