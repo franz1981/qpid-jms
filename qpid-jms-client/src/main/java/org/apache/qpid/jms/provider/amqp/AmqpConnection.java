@@ -271,7 +271,7 @@ public class AmqpConnection extends AmqpAbstractResource<JmsConnectionInfo, Conn
             return null;
         }
 
-        return getProvider().getScheduler().schedule(task, delay, TimeUnit.MILLISECONDS);
+        return getProvider().schedule(task, delay, TimeUnit.MILLISECONDS);
     }
 
     @Override

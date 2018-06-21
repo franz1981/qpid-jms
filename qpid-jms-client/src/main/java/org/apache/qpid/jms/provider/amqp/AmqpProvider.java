@@ -25,11 +25,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.Future;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.ScheduledThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -37,6 +33,7 @@ import javax.jms.JMSException;
 import javax.jms.JMSSecurityRuntimeException;
 import javax.net.ssl.SSLContext;
 
+import io.netty.channel.DefaultEventLoop;
 import org.apache.qpid.jms.JmsConnectionExtensions;
 import org.apache.qpid.jms.JmsTemporaryDestination;
 import org.apache.qpid.jms.message.JmsInboundMessageDispatch;
@@ -135,7 +132,8 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
 
     private final URI remoteURI;
     private final AtomicBoolean closed = new AtomicBoolean();
-    private ScheduledThreadPoolExecutor serializer;
+    private final ExecutorService serializer;
+    private final ScheduledExecutorService scheduler;
     private final org.apache.qpid.proton.engine.Transport protonTransport =
         org.apache.qpid.proton.engine.Transport.Factory.create();
     private final Collector protonCollector = new CollectorImpl();
@@ -155,13 +153,17 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
     public AmqpProvider(URI remoteURI, Transport transport) {
         this.remoteURI = remoteURI;
         this.transport = transport;
-
-        serializer = new ScheduledThreadPoolExecutor(1, new QpidJMSThreadFactory(
-            "AmqpProvider :(" + PROVIDER_SEQUENCE.incrementAndGet() + "):[" +
-            remoteURI.getScheme() + "://" + remoteURI.getHost() + ":" + remoteURI.getPort() + "]", true));
-
-        serializer.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
-        serializer.setContinueExistingPeriodicTasksAfterShutdownPolicy(false);
+        final int providerId = PROVIDER_SEQUENCE.incrementAndGet();
+        serializer = new ForkJoinPool(1, pool -> {
+            final ForkJoinWorkerThread worker = ForkJoinPool.defaultForkJoinWorkerThreadFactory.newThread(pool);
+            worker.setName("AmqpProvider :(" + providerId + "):[" +
+                    remoteURI.getScheme() + "://" + remoteURI.getHost() + ":" + remoteURI.getPort() + "]");
+            worker.setDaemon(true);
+            return worker;
+        }, null , false);
+        scheduler = new DefaultEventLoop(new QpidJMSThreadFactory(
+                "AmqpProvider Timer :(" + providerId + "):[" +
+                        remoteURI.getScheme() + "://" + remoteURI.getHost() + ":" + remoteURI.getPort() + "]", true));
     }
 
     @Override
@@ -373,6 +375,7 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
                         }
                     }
                 } finally {
+                    ThreadPoolUtils.shutdownGraceful(scheduler);
                     ThreadPoolUtils.shutdownGraceful(serializer);
                 }
             }
@@ -1076,7 +1079,8 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
         if (deadline != 0) {
             long delay = deadline - now;
             LOG.trace("IdleTimeoutCheck being initiated, initial delay: {}", delay);
-            nextIdleTimeoutCheck = serializer.schedule(new IdleTimeoutCheck(), delay, TimeUnit.MILLISECONDS);
+            final IdleTimeoutCheck idleTimeoutCheck = new IdleTimeoutCheck();
+            nextIdleTimeoutCheck = scheduler.schedule(()->serializer.execute(idleTimeoutCheck), delay, TimeUnit.MILLISECONDS);
         }
 
         ProviderListener listener = this.listener;
@@ -1367,8 +1371,9 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
         return protonConnection;
     }
 
-    ScheduledExecutorService getScheduler() {
-        return this.serializer;
+
+    ScheduledFuture<?> schedule(final Runnable task, long delay, TimeUnit timeUnit){
+        return this.scheduler.schedule(()->serializer.execute(task), delay, timeUnit);
     }
 
     @Override
@@ -1392,7 +1397,7 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
      */
     public ScheduledFuture<?> scheduleRequestTimeout(final AsyncResult request, long timeout, final Exception error) {
         if (timeout != JmsConnectionInfo.INFINITE) {
-            return serializer.schedule(new Runnable() {
+            final Runnable task = new Runnable() {
 
                 @Override
                 public void run() {
@@ -1400,7 +1405,8 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
                     pumpToProtonTransport();
                 }
 
-            }, timeout, TimeUnit.MILLISECONDS);
+            };
+            return scheduler.schedule(()->serializer.execute(task), timeout, TimeUnit.MILLISECONDS);
         }
 
         return null;
@@ -1422,7 +1428,7 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
      */
     public ScheduledFuture<?> scheduleRequestTimeout(final AsyncResult request, long timeout, final AmqpExceptionBuilder builder) {
         if (timeout != JmsConnectionInfo.INFINITE) {
-            return serializer.schedule(new Runnable() {
+            final Runnable task = new Runnable() {
 
                 @Override
                 public void run() {
@@ -1430,7 +1436,8 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
                     pumpToProtonTransport();
                 }
 
-            }, timeout, TimeUnit.MILLISECONDS);
+            };
+            return scheduler.schedule(()->serializer.execute(task), timeout, TimeUnit.MILLISECONDS);
         }
 
         return null;
@@ -1504,7 +1511,7 @@ public class AmqpProvider implements Provider, TransportListener , AmqpResourceP
                         long delay = deadline - now;
                         checkScheduled = true;
                         LOG.trace("IdleTimeoutCheck rescheduling with delay: {}", delay);
-                        nextIdleTimeoutCheck = serializer.schedule(this, delay, TimeUnit.MILLISECONDS);
+                        nextIdleTimeoutCheck = scheduler.schedule(()->serializer.execute(this), delay, TimeUnit.MILLISECONDS);
                     }
                 }
             } else {

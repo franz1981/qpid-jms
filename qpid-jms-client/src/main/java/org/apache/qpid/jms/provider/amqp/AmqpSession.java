@@ -200,7 +200,7 @@ public class AmqpSession extends AmqpAbstractResource<JmsSessionInfo, Session> i
             return null;
         }
 
-        return getProvider().getScheduler().schedule(task, delay, TimeUnit.MILLISECONDS);
+        return getProvider().schedule(task, delay, TimeUnit.MILLISECONDS);
     }
 
     @Override
